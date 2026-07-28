@@ -208,6 +208,7 @@ def full_reset():
     for k, v in DEFAULT_STATE.items():
         st.session_state[k] = deque(maxlen=v.maxlen) if isinstance(v, deque) else v
     build_csv.clear()                            # cached CSV of the old run
+    build_numbers_csv.clear()                    # cached numbers-only list too
     shutil.rmtree(RUNS_DIR, ignore_errors=True)  # results, logs, resume points
 
 
@@ -287,15 +288,33 @@ def ingest(results_file):
     return len(lines)
 
 
-@st.cache_data(show_spinner="Building CSV…")
-def build_csv(results_file, size, mtime):
-    """Full CSV straight from disk. Cached on (size, mtime) so it is only
-    rebuilt when new results have landed — not on every 3s rerun."""
-    out = StringIO()
-    w = csv.writer(out)
-    w.writerow(["Phone", "Found", "State/Location", "DNC Status", "Litigator",
-                "Blacklist", "Person Name", "Age/Year", "Lives At", "City",
-                "State", "ZIP", "Error"])
+MULTI_SEP = " | "          # separates several values packed into one cell
+
+
+def _dedupe(items, fields):
+    """Drop items whose `fields` are all identical to an earlier one, keeping
+    first-seen order. Used so a person or address listed twice for the same
+    phone number only lands in the export once."""
+    seen, kept = set(), []
+    for it in items:
+        key = tuple(str(it.get(f, "")).strip() for f in fields)
+        if not any(key) or key in seen:
+            continue
+        seen.add(key)
+        kept.append(it)
+    return kept
+
+
+def _pack(items, field):
+    """One cell holding `field` from every item, in item order. Positions line
+    up across columns, so the 2nd City belongs to the 2nd Lives At."""
+    return MULTI_SEP.join(str(it.get(field, "")).strip() for it in items)
+
+
+def _iter_results(results_file):
+    """Yield one parsed record per phone number, skipping repeats so a phone
+    that was written twice never shows up twice in the export."""
+    seen_phones = set()
     with open(results_file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -305,33 +324,72 @@ def build_csv(results_file, size, mtime):
                 d = json.loads(line)
             except Exception:
                 continue
-            c = d.get("Compliance", {}) or {}
-            base = [d.get("Phone", ""), d.get("Found", False),
-                    c.get("State/Location", ""), c.get("DNC Status", ""),
-                    c.get("Litigator", ""), c.get("Blacklist", "")]
-            persons = d.get("Persons", []) or [None]
-            for p in persons:
-                addrs = (p.get("Addresses") or [None]) if p else [None]
-                for a in addrs:
-                    w.writerow(base + [
-                        p.get("Name", "") if p else "",
-                        p.get("Age/Year", "") if p else "",
-                        a.get("Lives At", "") if a else "",
-                        a.get("City", "") if a else "",
-                        a.get("State", "") if a else "",
-                        a.get("ZIP", "") if a else "",
-                        d.get("Error") or "",
-                    ])
+            phone = str(d.get("Phone", ""))
+            if phone in seen_phones:
+                continue
+            seen_phones.add(phone)
+            yield phone, d
+
+
+@st.cache_data(show_spinner="Building CSV…")
+def build_csv(results_file, size, mtime):
+    """Full CSV straight from disk — exactly one row per phone number. Every
+    person and address found for that number is packed into its own cell so the
+    phone (and the rest of the compliance data) is never repeated. Cached on
+    (size, mtime) so it is only rebuilt when new results have landed."""
+    out = StringIO()
+    w = csv.writer(out)
+    w.writerow(["Phone", "Found", "State/Location", "DNC Status", "Litigator",
+                "Blacklist", "Person Name", "Age/Year", "Lives At", "City",
+                "State", "ZIP", "Error"])
+    for phone, d in _iter_results(results_file):
+        c = d.get("Compliance", {}) or {}
+        persons = _dedupe([p for p in (d.get("Persons") or []) if p],
+                          ("Name", "Age/Year"))
+        addrs = _dedupe([a for p in persons for a in (p.get("Addresses") or []) if a],
+                        ("Lives At", "City", "State", "ZIP"))
+        w.writerow([
+            phone, d.get("Found", False),
+            c.get("State/Location", ""), c.get("DNC Status", ""),
+            c.get("Litigator", ""), c.get("Blacklist", ""),
+            _pack(persons, "Name"),
+            _pack(persons, "Age/Year"),
+            _pack(addrs, "Lives At"),
+            _pack(addrs, "City"),
+            _pack(addrs, "State"),
+            _pack(addrs, "ZIP"),
+            d.get("Error") or "",
+        ])
     return out.getvalue()
 
 
-def csv_download(results_file, label="⬇️ Download CSV"):
+@st.cache_data(show_spinner="Building numbers list…")
+def build_numbers_csv(results_file, size, mtime):
+    """Single-column CSV of just the phone numbers where Found is True."""
+    out = StringIO()
+    w = csv.writer(out)
+    w.writerow(["Phone"])
+    for phone, d in _iter_results(results_file):
+        if d.get("Found"):
+            w.writerow([phone])
+    return out.getvalue()
+
+
+def csv_download(results_file, label="⬇️ Download CSV",
+                 numbers_label="⬇️ Download Numbers Only"):
     try:
         stat = os.stat(results_file)
     except Exception:
         return
-    st.download_button(label, build_csv(results_file, stat.st_size, stat.st_mtime),
-                       "infolookup_results.csv", "text/csv", use_container_width=True)
+    c1, c2 = st.columns(2)
+    c1.download_button(label, build_csv(results_file, stat.st_size, stat.st_mtime),
+                       "infolookup_results.csv", "text/csv",
+                       use_container_width=True)
+    c2.download_button(numbers_label,
+                       build_numbers_csv(results_file, stat.st_size, stat.st_mtime),
+                       "infolookup_found_numbers.csv", "text/csv",
+                       use_container_width=True,
+                       help="Only the phone numbers where Found is True.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -551,7 +609,10 @@ elif st.session_state.run_complete:
             st.dataframe(list(st.session_state._recent)[::-1],
                          use_container_width=True, hide_index=True, height=420)
         st.caption("The table shows recent rows only — the CSV below contains "
-                   "every result, expanded one row per address.")
+                   "every result, one row per phone number (multiple addresses "
+                   f"are packed into one cell, separated by “{MULTI_SEP.strip()}”). "
+                   "**Numbers Only** gives you a single column with just the "
+                   "numbers where Found is True.")
         st.markdown("---")
         csv_download(results_file)
 
