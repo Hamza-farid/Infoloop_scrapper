@@ -261,14 +261,7 @@ def main(phones, out_file):
 
     with sync_playwright() as p:
         print("[BROWSER] Launching Chromium...", flush=True)
-        # On Linux (Streamlit Cloud) use system chromium; on Windows use playwright-downloaded one
-        import shutil
-        system_chromium = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
-        if system_chromium and sys.platform != "win32":
-            browser = p.chromium.launch(headless=True, executable_path=system_chromium)
-            print(f"[BROWSER] Using system chromium: {system_chromium}", flush=True)
-        else:
-            browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
         print("[BROWSER] Launched OK!", flush=True)

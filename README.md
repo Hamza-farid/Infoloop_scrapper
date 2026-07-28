@@ -115,5 +115,3 @@ All scraping settings are in `scraper/config.py`:
 | Age/Year | e.g. "71 yrs (1955)" |
 | Lives At / City / State / ZIP | Address records |
 | Error | Human-readable error message if scrape failed |
-
-##Link :https://infoloopscrapper-4wzim3xqkrwxzvzysnapup.streamlit.app/
