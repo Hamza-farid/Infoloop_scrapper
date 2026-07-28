@@ -1,24 +1,44 @@
 """
 InfoLookup Scraper — Streamlit UI
 Run:  streamlit run app.py
+
+Built for large batches. Three things make that possible:
+  * The heavy lifting happens in worker.py (a separate process running a pool of
+    parallel browser pages). This UI only tails its JSONL output.
+  * Results are NEVER all rendered as cards — that's what made big runs freeze
+    the browser. We keep running counters + the most recent rows, and build the
+    full CSV from disk only when you ask for it.
+  * Runs live in ./runs/<id>/ instead of temp files, so a crashed or interrupted
+    run can be resumed instead of restarted.
 """
 
-import sys
-import os
-import json
-import subprocess
-import tempfile
-import time
-import psutil
-from io import StringIO
 import csv
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import deque
+from io import StringIO
 
+import psutil
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from scraper.config import CONCURRENCY
 from utils.phone_generator import generate_phone_numbers, count_numbers
-from utils.models import LookupResult, ComplianceStatus, PersonRecord, AddressRecord
+
+APP_DIR  = os.path.dirname(os.path.abspath(__file__))
+RUNS_DIR = os.path.join(APP_DIR, "runs")
+RECENT_MAX = 200          # rows kept in memory for the live table
+
+# Throughput model for the ETA, fitted to measured runs (dev machine, 4 and 8
+# parallel pages: 1.2/s and 1.78/s). Scaling is SUBLINEAR — doubling pages does
+# not double speed, because Chromium becomes CPU-bound. Streamlit Cloud's shared
+# CPU is slower still, so treat this as an optimistic bound.
+def estimate_rate(pages: int) -> float:
+    return (pages ** 0.7) / 2.3
 
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="InfoLookup Scraper", page_icon="📞", layout="wide")
@@ -27,36 +47,38 @@ st.markdown("""
 <style>
     .main-title { font-size:2rem; font-weight:800; color:#00d4ff; }
     .subtitle   { color:#888; margin-top:0; }
-    .result-card {
-        background:#1a1d2e; border:1px solid #2a2d3e;
-        border-radius:12px; padding:1.2rem; margin-bottom:1rem;
-    }
-    .status-clean   { color:#00e676; font-weight:700; }
-    .status-flagged { color:#ff5252; font-weight:700; }
-    .status-unknown { color:#ffd740; font-weight:700; }
-    .found-chip    { background:#1b5e20; color:#69f0ae; padding:3px 10px; border-radius:20px; font-size:0.78rem; font-weight:700; }
-    .nofound-chip  { background:#3e2723; color:#ff8a65; padding:3px 10px; border-radius:20px; font-size:0.78rem; font-weight:700; }
-    .error-chip    { background:#4a1942; color:#f48fb1; padding:3px 10px; border-radius:20px; font-size:0.78rem; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state ─────────────────────────────────────────────────────────────
-for k, v in {
-    "results": [], "running": False, "run_complete": False,
-    "phones_to_run": [],
-    "_pid": None,           # worker process PID (serializable)
-    "_log_file": None,      # worker stdout log file path
-    "_out_file": None,      # JSONL results file path
-    "_phones_file": None,
+DEFAULT_STATE = {
+    "running": False,
+    "run_complete": False,
+    "run_dir": None,
+    "_pid": None,
+    "_total": 0,
+    "_started_at": None,
     "_file_offset": 0,
     "_log_offset": 0,
+    "_log_tail": deque(maxlen=40),
+    "_recent": deque(maxlen=RECENT_MAX),
+    "_done": 0,
+    "_found": 0,
+    "_no_info": 0,
+    "_errors": 0,
     "_worker_error": None,
-}.items():
+}
+for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-def _is_pid_running(pid):
+# ─────────────────────────────────────────────────────────────────────────────
+# Process helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_pid_running(pid):
+    if not pid:
+        return False
     try:
         p = psutil.Process(pid)
         return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
@@ -64,122 +86,236 @@ def _is_pid_running(pid):
         return False
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def _status_html(val):
-    v = val.lower()
-    if v == "clean":              return f'<span class="status-clean">✅ {val}</span>'
-    if v in ("flagged","listed"): return f'<span class="status-flagged">🚨 {val}</span>'
-    return f'<span class="status-unknown">❓ {val}</span>'
-
-
-def _dict_to_result(d: dict) -> LookupResult:
-    r = LookupResult(phone=d.get("Phone",""), found=d.get("Found", False), error=d.get("Error"))
-    c = d.get("Compliance", {})
-    if c:
-        r.compliance = ComplianceStatus(
-            state_location=c.get("State/Location",""),
-            dnc_status=c.get("DNC Status","unknown"),
-            litigator=c.get("Litigator","unknown"),
-            blacklist=c.get("Blacklist","unknown"),
-        )
-    for p in d.get("Persons", []):
-        pr = PersonRecord(name=p.get("Name",""), age_year=p.get("Age/Year",""))
-        for a in p.get("Addresses", []):
-            pr.addresses.append(AddressRecord(
-                lives_at=a.get("Lives At",""), city=a.get("City",""),
-                state=a.get("State",""),       zip_code=a.get("ZIP",""),
-            ))
-        r.persons.append(pr)
-    return r
-
-
-def _render_result(res: LookupResult):
-    if res.error:    chip = '<span class="error-chip">⚠️ ERROR</span>'
-    elif res.found:  chip = '<span class="found-chip">✅ OWNER FOUND</span>'
-    else:            chip = '<span class="nofound-chip">🚫 NO OWNER INFO</span>'
-
-    st.markdown(f"""
-    <div class="result-card">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem">
-            <span style="font-size:1.1rem;font-weight:700;color:#00d4ff">📞 {res.phone}</span>
-            {chip}
-        </div>
-    """, unsafe_allow_html=True)
-
-    if res.error:
-        st.error(f"Something went wrong: {res.error}")
-        st.markdown("</div>", unsafe_allow_html=True)
+def kill_tree(pid):
+    """Kill the worker AND its chromium children — orphaned browsers eat the
+    container's memory and will break the next run."""
+    try:
+        parent = psutil.Process(pid)
+    except Exception:
         return
-
-    if res.compliance:
-        c = res.compliance
-        c1,c2,c3,c4 = st.columns(4)
-        c1.markdown(f"**📍 Location**<br>{c.state_location or '—'}", unsafe_allow_html=True)
-        c2.markdown(f"**DNC**<br>{_status_html(c.dnc_status)}",       unsafe_allow_html=True)
-        c3.markdown(f"**Litigator**<br>{_status_html(c.litigator)}",  unsafe_allow_html=True)
-        c4.markdown(f"**Blacklist**<br>{_status_html(c.blacklist)}",  unsafe_allow_html=True)
-
-    if res.found and res.persons:
-        st.markdown("<hr style='margin:.8rem 0'>", unsafe_allow_html=True)
-        for p in res.persons:
-            st.markdown(f"**👤 {p.name}**  {p.age_year}", unsafe_allow_html=True)
-            if p.addresses:
-                import pandas as pd
-                st.dataframe(pd.DataFrame([a.to_dict() for a in p.addresses]),
-                             use_container_width=True, hide_index=True)
-    elif not res.found:
-        st.markdown("*No owner information available.*")
-
-    st.markdown("</div>", unsafe_allow_html=True)
+    procs = parent.children(recursive=True) + [parent]
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    _, alive = psutil.wait_procs(procs, timeout=5)
+    for p in alive:
+        try:
+            p.kill()
+        except Exception:
+            pass
 
 
-def _results_to_csv(results):
-    out = StringIO()
-    w = csv.writer(out)
-    w.writerow(["Phone","Found","State/Location","DNC Status","Litigator","Blacklist",
-                "Person Name","Age/Year","Lives At","City","State","ZIP","Error"])
-    for r in results:
-        co = r.compliance
-        persons = r.persons if r.found and r.persons else [None]
-        for p in persons:
-            addrs = p.addresses if p and p.addresses else [None]
-            for a in addrs:
-                w.writerow([
-                    r.phone, r.found,
-                    co.state_location if co else "", co.dnc_status if co else "",
-                    co.litigator if co else "",      co.blacklist  if co else "",
-                    p.name if p else "",   p.age_year if p else "",
-                    a.lives_at if a else "", a.city  if a else "",
-                    a.state    if a else "", a.zip_code if a else "",
-                    r.error or ""
-                ])
-    return out.getvalue()
+# ─────────────────────────────────────────────────────────────────────────────
+# Run directory / resume
+# ─────────────────────────────────────────────────────────────────────────────
+
+def paths_for(run_dir):
+    return (os.path.join(run_dir, "phones.json"),
+            os.path.join(run_dir, "results.jsonl"),
+            os.path.join(run_dir, "worker.log"),
+            os.path.join(run_dir, "meta.json"))
 
 
-def _read_new_lines(filepath, offset):
+def completed_phones(results_file):
+    """Phones already written to the JSONL — used to skip work on resume."""
+    done = set()
+    try:
+        with open(results_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    done.add(json.loads(line).get("Phone", ""))
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        pass
+    return done
+
+
+def list_runs():
+    if not os.path.isdir(RUNS_DIR):
+        return []
+    out = []
+    for name in sorted(os.listdir(RUNS_DIR), reverse=True):
+        run_dir = os.path.join(RUNS_DIR, name)
+        _, results_file, _, meta_file = paths_for(run_dir)
+        if not os.path.isfile(meta_file):
+            continue
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+        meta["run_dir"] = run_dir
+        meta["done"] = sum(1 for _ in open(results_file, encoding="utf-8")) \
+            if os.path.isfile(results_file) else 0
+        out.append(meta)
+    return out
+
+
+def start_worker(run_dir, phones, concurrency, total_target):
+    phones_file, results_file, log_file, meta_file = paths_for(run_dir)
+
+    with open(phones_file, "w", encoding="utf-8") as f:
+        json.dump(phones, f)
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump({"total": total_target,
+                   "concurrency": concurrency,
+                   "label": os.path.basename(run_dir)}, f)
+    open(results_file, "a", encoding="utf-8").close()
+
+    worker_env = os.environ.copy()
+    worker_env["PYTHONUTF8"] = "1"
+
+    with open(log_file, "a", encoding="utf-8") as log_out:
+        proc = subprocess.Popen(
+            [sys.executable, "-u", os.path.join(APP_DIR, "worker.py"),
+             phones_file, results_file, str(concurrency)],
+            stdout=log_out, stderr=log_out, env=worker_env,
+        )
+    return proc.pid
+
+
+def reset_live_state(run_dir, pid, total, keep_offsets=False):
+    st.session_state.run_dir      = run_dir
+    st.session_state._pid         = pid
+    st.session_state._total       = total
+    st.session_state.running      = True
+    st.session_state.run_complete = False
+    st.session_state._started_at  = time.monotonic()
+    st.session_state._worker_error = None
+    if not keep_offsets:
+        st.session_state._file_offset = 0
+        st.session_state._log_offset  = 0
+        st.session_state._recent   = deque(maxlen=RECENT_MAX)
+        st.session_state._log_tail = deque(maxlen=40)
+        st.session_state._done = st.session_state._found = 0
+        st.session_state._no_info = st.session_state._errors = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result reading (incremental — never re-parses the whole file)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def read_new_lines(filepath, offset):
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             f.seek(offset)
             data = f.read()
             new_offset = f.tell()
-        lines = [l.strip() for l in data.splitlines() if l.strip()]
-        return lines, new_offset
+        return [l for l in data.splitlines() if l.strip()], new_offset
     except Exception:
         return [], offset
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+def summarise(d: dict) -> dict:
+    """One compact row per number for the live table."""
+    persons = d.get("Persons", []) or []
+    comp = d.get("Compliance", {}) or {}
+    if d.get("Error"):
+        status = "⚠️ error"
+    elif d.get("Found"):
+        status = "✅ found"
+    else:
+        status = "🚫 no info"
+    return {
+        "Phone": d.get("Phone", ""),
+        "Status": status,
+        "Name": persons[0].get("Name", "") if persons else "",
+        "Age/Year": persons[0].get("Age/Year", "") if persons else "",
+        "Location": comp.get("State/Location", ""),
+        "DNC": comp.get("DNC Status", ""),
+        "Litigator": comp.get("Litigator", ""),
+        "Blacklist": comp.get("Blacklist", ""),
+        "Records": len(persons),
+        "Error": (d.get("Error") or "")[:90],
+    }
+
+
+def ingest(results_file):
+    """Pull newly written results into counters + the recent-rows buffer."""
+    lines, new_offset = read_new_lines(results_file, st.session_state._file_offset)
+    st.session_state._file_offset = new_offset
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        st.session_state._done += 1
+        if d.get("Error"):
+            st.session_state._errors += 1
+        elif d.get("Found"):
+            st.session_state._found += 1
+        else:
+            st.session_state._no_info += 1
+        st.session_state._recent.append(summarise(d))
+    return len(lines)
+
+
+@st.cache_data(show_spinner="Building CSV…")
+def build_csv(results_file, size, mtime):
+    """Full CSV straight from disk. Cached on (size, mtime) so it is only
+    rebuilt when new results have landed — not on every 3s rerun."""
+    out = StringIO()
+    w = csv.writer(out)
+    w.writerow(["Phone", "Found", "State/Location", "DNC Status", "Litigator",
+                "Blacklist", "Person Name", "Age/Year", "Lives At", "City",
+                "State", "ZIP", "Error"])
+    with open(results_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            c = d.get("Compliance", {}) or {}
+            base = [d.get("Phone", ""), d.get("Found", False),
+                    c.get("State/Location", ""), c.get("DNC Status", ""),
+                    c.get("Litigator", ""), c.get("Blacklist", "")]
+            persons = d.get("Persons", []) or [None]
+            for p in persons:
+                addrs = (p.get("Addresses") or [None]) if p else [None]
+                for a in addrs:
+                    w.writerow(base + [
+                        p.get("Name", "") if p else "",
+                        p.get("Age/Year", "") if p else "",
+                        a.get("Lives At", "") if a else "",
+                        a.get("City", "") if a else "",
+                        a.get("State", "") if a else "",
+                        a.get("ZIP", "") if a else "",
+                        d.get("Error") or "",
+                    ])
+    return out.getvalue()
+
+
+def csv_download(results_file, label="⬇️ Download CSV"):
+    try:
+        stat = os.stat(results_file)
+    except Exception:
+        return
+    st.download_button(label, build_csv(results_file, stat.st_size, stat.st_mtime),
+                       "infolookup_results.csv", "text/csv", use_container_width=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar
+# ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📞 Phone Range Builder")
-    st.markdown("### Area Code (3 digits)")
-    area_code = st.text_input("Area Code", value="910", max_chars=3, label_visibility="collapsed")
+    area_code = st.text_input("Area Code (3 digits)", value="910", max_chars=3)
 
-    st.markdown("### Exchange — middle 3 digits")
+    st.markdown("**Exchange — middle 3 digits**")
     ec1, ec2 = st.columns(2)
-    exchange_start = ec1.number_input("From", 0, 999,  785, key="es")
-    exchange_end   = ec2.number_input("To",   0, 999,  785, key="ee")
+    exchange_start = ec1.number_input("From", 0, 999, 785, key="es")
+    exchange_end   = ec2.number_input("To",   0, 999, 785, key="ee")
 
-    st.markdown("### Subscriber — last 4 digits")
+    st.markdown("**Subscriber — last 4 digits**")
     sc1, sc2 = st.columns(2)
     subscriber_start = sc1.number_input("From", 0, 9999, 2360, key="ss")
     subscriber_end   = sc2.number_input("To",   0, 9999, 2365, key="se")
@@ -187,191 +323,210 @@ with st.sidebar:
     valid_area  = len(area_code.strip()) == 3 and area_code.strip().isdigit()
     valid_range = exchange_start <= exchange_end and subscriber_start <= subscriber_end
 
+    total = 0
     if valid_area and valid_range:
-        total = count_numbers(exchange_start, exchange_end, subscriber_start, subscriber_end)
+        total = count_numbers(exchange_start, exchange_end,
+                              subscriber_start, subscriber_end)
         st.success(f"✅ {total:,} numbers")
-        preview_phones = list(generate_phone_numbers(area_code.strip(),
-                              exchange_start, exchange_end, subscriber_start, subscriber_end))
-        snippet = "\n".join(preview_phones[:5]) + (f"\n... +{total-5} more" if total > 5 else "")
-        st.code(snippet, language=None)
     else:
-        if not valid_area:  st.error("Area code must be exactly 3 digits")
-        if not valid_range: st.error("'From' must be ≤ 'To'")
-        preview_phones = []
-        total = 0
+        if not valid_area:
+            st.error("Area code must be exactly 3 digits")
+        if not valid_range:
+            st.error("'From' must be ≤ 'To'")
 
     st.markdown("---")
-    run_btn = st.button("🚀 Start Lookup",
-                        disabled=(not valid_area or not valid_range or total == 0
-                                  or st.session_state.running),
-                        use_container_width=True, type="primary")
-    if st.session_state.results:
-        if st.button("🗑️ Clear Results", use_container_width=True):
-            st.session_state.results      = []
-            st.session_state.run_complete = False
+    st.markdown("### ⚡ Speed")
+    concurrency = st.slider(
+        "Parallel browser pages", 1, 8, CONCURRENCY,
+        help="How many numbers are searched at the same time. Each page costs "
+             "~25 MB of RAM on top of ~130 MB for the browser.",
+    )
+    if concurrency >= 7:
+        st.warning("6+ pages can exhaust Streamlit Cloud's ~1 GB RAM and get the "
+                   "app killed mid-run. Try 4–5 first.")
+
+    if total:
+        rate = estimate_rate(concurrency)
+        eta_h = total / rate / 3600
+        eta_txt = (f"**{eta_h * 60:,.0f} min**" if eta_h < 1.5
+                   else f"**{eta_h:,.1f} hours**")
+        st.caption(f"≈ **{rate:.1f}/sec** (~{rate * 3600:,.0f}/hour) → "
+                   f"{eta_txt} for {total:,} numbers")
+        st.caption("Best case — shared cloud CPU is slower than this.")
+
+    st.markdown("---")
+    run_btn = st.button(
+        "🚀 Start Lookup", type="primary", use_container_width=True,
+        disabled=(not valid_area or not valid_range or total == 0
+                  or st.session_state.running),
+    )
+
+    if st.session_state.running:
+        if st.button("⏹️ Stop Run", use_container_width=True):
+            kill_tree(st.session_state._pid)
+            st.session_state.running = False
+            st.session_state.run_complete = True
             st.rerun()
 
-# ── Main header ───────────────────────────────────────────────────────────────
+    # ── Resume ───────────────────────────────────────────────────────────────
+    if not st.session_state.running:
+        prior = [r for r in list_runs() if r["done"] < r.get("total", 0)]
+        if prior:
+            st.markdown("---")
+            st.markdown("### ♻️ Resume unfinished run")
+            pick = st.selectbox(
+                "Run", prior,
+                format_func=lambda r: f"{r['label']} — {r['done']:,}/{r['total']:,}",
+            )
+            if st.button("▶️ Resume", use_container_width=True):
+                _, results_file, _, _ = paths_for(pick["run_dir"])
+                phones_file = paths_for(pick["run_dir"])[0]
+                with open(phones_file, "r", encoding="utf-8") as f:
+                    original = json.load(f)
+                remaining = [p for p in original if p not in completed_phones(results_file)]
+                if remaining:
+                    pid = start_worker(pick["run_dir"], remaining,
+                                       concurrency, pick["total"])
+                    reset_live_state(pick["run_dir"], pid, pick["total"])
+                    st.rerun()
+                else:
+                    st.info("That run is already complete.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Header
+# ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-title">📞 InfoLookup Scraper</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Automated phone lookup via infolookup.site</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Automated phone lookup via infolookup.site</div>',
+            unsafe_allow_html=True)
 st.markdown("---")
 
-# ── Start batch ───────────────────────────────────────────────────────────────
-if run_btn and preview_phones and not st.session_state.running:
-    # Temp file for phones list
-    pf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
-    json.dump(preview_phones, pf)
-    pf.close()
-
-    # Temp file for JSONL results (worker appends here)
-    rf = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
-    rf.close()
-
-    # Temp file to capture worker stdout (for error display)
-    lf = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False, encoding="utf-8")
-    lf.close()
-
-    worker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker.py")
-
-    # PYTHONUTF8=1 forces UTF-8 stdout/stderr in the child process on Windows
-    worker_env = os.environ.copy()
-    worker_env["PYTHONUTF8"] = "1"
-
-    with open(lf.name, "w", encoding="utf-8") as log_out:
-        proc = subprocess.Popen(
-            [sys.executable, "-u", worker_path, pf.name, rf.name],
-            stdout=log_out,
-            stderr=log_out,
-            env=worker_env,
-        )
-
-    st.session_state._pid          = proc.pid
-    st.session_state._phones_file  = pf.name
-    st.session_state._out_file     = rf.name
-    st.session_state._log_file     = lf.name
-    st.session_state.phones_to_run = preview_phones
-    st.session_state.results       = []
-    st.session_state.run_complete  = False
-    st.session_state.running       = True
-    st.session_state._file_offset  = 0
-    st.session_state._log_offset   = 0
-    st.session_state._worker_error = None
+# ─────────────────────────────────────────────────────────────────────────────
+# Start a new run
+# ─────────────────────────────────────────────────────────────────────────────
+if run_btn and total and not st.session_state.running:
+    phones = list(generate_phone_numbers(area_code.strip(), exchange_start,
+                                         exchange_end, subscriber_start,
+                                         subscriber_end))
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    pid = start_worker(run_dir, phones, concurrency, len(phones))
+    reset_live_state(run_dir, pid, len(phones))
     st.rerun()
 
-# ── Running: poll for results ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Live view
+# ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.running:
-    pid      = st.session_state._pid
-    out_file = st.session_state._out_file
-    log_file = st.session_state._log_file
-    phones   = st.session_state.phones_to_run
-    total_n  = len(phones)
-    offset   = st.session_state._file_offset
+    _, results_file, log_file, _ = paths_for(st.session_state.run_dir)
+    ingest(results_file)
 
-    # Read new result lines from JSONL file
-    new_lines, new_offset = _read_new_lines(out_file, offset)
-    st.session_state._file_offset = new_offset
-    for line in new_lines:
-        try:
-            st.session_state.results.append(_dict_to_result(json.loads(line)))
-        except Exception:
-            pass
+    done  = st.session_state._done
+    total_n = st.session_state._total
+    still_running = is_pid_running(st.session_state._pid)
+    elapsed = time.monotonic() - (st.session_state._started_at or time.monotonic())
+    rate = done / elapsed if elapsed > 0 and done else 0
 
-    done_count = len(st.session_state.results)
-    pct = done_count / total_n if total_n else 1
+    m = st.columns(5)
+    m[0].metric("Progress", f"{done:,}/{total_n:,}")
+    m[1].metric("✅ Found",  f"{st.session_state._found:,}")
+    m[2].metric("🚫 No Info", f"{st.session_state._no_info:,}")
+    m[3].metric("⚠️ Errors", f"{st.session_state._errors:,}")
+    m[4].metric("Speed", f"{rate:.2f}/s", f"{rate * 3600:,.0f}/hr" if rate else None)
 
-    still_running = _is_pid_running(pid)
+    st.progress(min(done / total_n, 1.0) if total_n else 0.0)
+    if rate > 0 and done < total_n:
+        st.caption(f"Elapsed {elapsed / 60:.1f} min · "
+                   f"ETA ~{(total_n - done) / rate / 60:,.0f} min")
 
-    st.info(f"🔄 Running... **{done_count}/{total_n}** complete")
-    st.progress(pct)
+    log_lines, st.session_state._log_offset = read_new_lines(
+        log_file, st.session_state._log_offset)
+    st.session_state._log_tail.extend(log_lines)
+    with st.expander("📋 Worker log (live)"):
+        st.code("\n".join(st.session_state._log_tail) or "waiting…", language=None)
 
-    # Show live terminal log in expander
-    log_lines, new_log_offset = _read_new_lines(log_file, st.session_state._log_offset)
-    st.session_state._log_offset = new_log_offset
-    if log_lines:
-        with st.expander("📋 Worker log (live)", expanded=False):
-            st.code("\n".join(log_lines), language=None)
+    st.markdown(f"#### Latest results (last {RECENT_MAX})")
+    if st.session_state._recent:
+        st.dataframe(list(st.session_state._recent)[::-1],
+                     use_container_width=True, hide_index=True, height=420)
+    else:
+        st.info("Launching browser…")
 
-    for r in st.session_state.results:
-        _render_result(r)
+    with st.expander("⬇️ Download results so far"):
+        csv_download(results_file, "⬇️ Download partial CSV")
 
     if not still_running:
-        # Process ended — drain remaining lines
-        final_lines, _ = _read_new_lines(out_file, new_offset)
-        for line in final_lines:
+        ingest(results_file)                      # drain final writes
+        if st.session_state._done == 0:
             try:
-                st.session_state.results.append(_dict_to_result(json.loads(line)))
+                with open(log_file, "r", encoding="utf-8") as f:
+                    st.session_state._worker_error = f.read()[-4000:]
             except Exception:
-                pass
-
-        # Check if worker crashed (no results written but process ended)
-        if not st.session_state.results:
-            try:
-                with open(log_file, "r", encoding="utf-8") as lf:
-                    crash_log = lf.read()
-                st.session_state._worker_error = crash_log
-            except Exception:
-                st.session_state._worker_error = "Worker process exited with no output."
-
-        # Cleanup
-        for f in [st.session_state._phones_file, out_file, log_file]:
-            try: os.unlink(f)
-            except Exception: pass
-
-        st.session_state.running      = False
+                st.session_state._worker_error = "Worker exited with no output."
+        st.session_state.running = False
         st.session_state.run_complete = True
         st.rerun()
     else:
-        time.sleep(2)
+        time.sleep(3)
         st.rerun()
 
-# ── Final results ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Finished view
+# ─────────────────────────────────────────────────────────────────────────────
 elif st.session_state.run_complete:
-    # Show crash log if worker died with no results
-    if st.session_state._worker_error and not st.session_state.results:
-        st.error("❌ The scraper process crashed before producing any results.")
-        st.markdown("**Technical details (share these when reporting the issue):**")
+    _, results_file, log_file, _ = paths_for(st.session_state.run_dir)
+
+    if st.session_state._worker_error and st.session_state._done == 0:
+        st.error("❌ The scraper crashed before producing any results.")
+        st.markdown("**Technical details (share these when reporting):**")
         st.code(st.session_state._worker_error, language=None)
+    else:
+        done = st.session_state._done
+        elapsed = time.monotonic() - (st.session_state._started_at or time.monotonic())
+        rate = done / elapsed if elapsed else 0
 
-    elif st.session_state.results:
-        results = st.session_state.results
-        found   = [r for r in results if r.found]
-        no_info = [r for r in results if not r.found and not r.error]
-        errors  = [r for r in results if r.error]
+        m = st.columns(5)
+        m[0].metric("🔍 Total",    f"{done:,}")
+        m[1].metric("✅ Found",    f"{st.session_state._found:,}")
+        m[2].metric("🚫 No Info",  f"{st.session_state._no_info:,}")
+        m[3].metric("⚠️ Errors",   f"{st.session_state._errors:,}")
+        m[4].metric("Avg speed",  f"{rate:.2f}/s")
 
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("🔍 Total",       len(results))
-        m2.metric("✅ Owner Found", len(found))
-        m3.metric("🚫 No Info",     len(no_info))
-        m4.metric("⚠️ Errors",      len(errors))
+        if done < st.session_state._total:
+            st.warning(f"Stopped at {done:,} of {st.session_state._total:,}. "
+                       "Use **♻️ Resume unfinished run** in the sidebar to "
+                       "continue where it left off — completed numbers are kept.")
         st.markdown("---")
-
-        t1,t2,t3,t4 = st.tabs([f"All ({len(results)})", f"✅ Found ({len(found)})",
-                                f"🚫 No Info ({len(no_info)})", f"⚠️ Errors ({len(errors)})"])
-        with t1:
-            for r in results: _render_result(r)
-        with t2:
-            [_render_result(r) for r in found]   if found   else st.info("None found.")
-        with t3:
-            [_render_result(r) for r in no_info] if no_info else st.info("None.")
-        with t4:
-            [_render_result(r) for r in errors]  if errors  else st.info("No errors.")
-
+        st.markdown(f"#### Last {RECENT_MAX} results")
+        if st.session_state._recent:
+            st.dataframe(list(st.session_state._recent)[::-1],
+                         use_container_width=True, hide_index=True, height=420)
+        st.caption("The table shows recent rows only — the CSV below contains "
+                   "every result, expanded one row per address.")
         st.markdown("---")
-        st.download_button("⬇️ Download CSV", _results_to_csv(results),
-                           "infolookup_results.csv", "text/csv", use_container_width=True)
+        csv_download(results_file)
+
+        with st.expander("📋 Worker log"):
+            lines, _ = read_new_lines(log_file, 0)
+            st.code("\n".join(lines[-300:]) or "—", language=None)
 
 else:
     st.markdown("""
     ### 👈 Set your phone range in the sidebar, then hit **Start Lookup**
 
-    **How it works:**
+    **How it works**
     1. Enter the **3-digit area code** (e.g. `910`)
-    2. Set **middle 3 digits** range (exchange)
-    3. Set **last 4 digits** range (subscriber)
-    4. Click **🚀 Start Lookup** — a background process searches each number
-    5. Results appear live as each number completes
-    6. Download all results as CSV when done
+    2. Set the **middle 3 digits** range (exchange)
+    3. Set the **last 4 digits** range (subscriber)
+    4. Pick how many **parallel browser pages** to use — this is the speed dial
+    5. Click **🚀 Start Lookup**; progress, speed and ETA update live
+    6. Download everything as CSV when it finishes
 
-    ---
-    **Example:** Area `910`, Exchange `785–785`, Subscriber `2360–2365` → 6 numbers
+    **Running big batches on Streamlit Cloud — please read**
+    - Keep this browser tab **open**. Streamlit Cloud sleeps idle apps, and that
+      kills the scraper with it.
+    - Completed results are saved to disk as they arrive, so if a run does die
+      you can **♻️ Resume** it from the sidebar instead of starting over.
+    - More pages is faster only up to a point. This container has ~1 GB RAM and
+      1–2 shared CPUs; past 5–6 pages Chromium starts thrashing and timing out.
     """)
