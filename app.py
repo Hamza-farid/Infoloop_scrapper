@@ -199,20 +199,16 @@ def new_run_dir():
     return run_dir
 
 
-def reset_ui_state():
-    """Wipe every counter, buffer and pointer so the screen goes back to the
-    clean 'nothing has run yet' state. Files on disk are left alone."""
+def full_reset():
+    """One button, total clean slate: stop anything running, wipe every counter
+    and buffer on screen, drop the cached CSV, and delete every saved run from
+    disk. Nothing from a previous run can survive into the next one."""
     if st.session_state.running:
         kill_tree(st.session_state._pid)
     for k, v in DEFAULT_STATE.items():
         st.session_state[k] = deque(maxlen=v.maxlen) if isinstance(v, deque) else v
-    build_csv.clear()          # drop any cached CSV of the previous run
-
-
-def delete_all_runs():
-    """Reset + remove every saved run from disk (no resume points survive)."""
-    reset_ui_state()
-    shutil.rmtree(RUNS_DIR, ignore_errors=True)
+    build_csv.clear()                            # cached CSV of the old run
+    shutil.rmtree(RUNS_DIR, ignore_errors=True)  # results, logs, resume points
 
 
 def reset_live_state(run_dir, pid, total, keep_offsets=False):
@@ -430,32 +426,28 @@ with head_l:
 # thing the user reaches for instead of hunting through the sidebar.
 with head_r:
     st.markdown('<div class="ctrl-pad"></div>', unsafe_allow_html=True)
-    run_btn = st.button(
-        "🚀 Start Lookup", type="primary", use_container_width=True,
-        disabled=(not valid_area or not valid_range or total == 0
-                  or st.session_state.running),
-    )
-
+    run_btn = False
     if st.session_state.running:
-        if st.button("⏹️ Stop Run", use_container_width=True):
+        # Same slot doubles as Stop while a run is live, so the panel is never
+        # more than two buttons. Stop keeps the results — Reset is the one that
+        # throws them away.
+        if st.button("⏹️ Stop Run", type="primary", use_container_width=True):
             kill_tree(st.session_state._pid)
             st.session_state.running = False
             st.session_state.run_complete = True
             st.rerun()
+    else:
+        run_btn = st.button(
+            "🚀 Start Lookup", type="primary", use_container_width=True,
+            disabled=(not valid_area or not valid_range or total == 0),
+        )
 
     if st.button("🔄 Reset", use_container_width=True,
-                 help="Clear the results shown on screen and start fresh. "
-                      "Saved runs stay on disk so you can still resume them."):
-        reset_ui_state()
+                 help="Stops the current run and clears everything — the "
+                      "results on screen AND the saved files on disk. The next "
+                      "run starts completely clean."):
+        full_reset()
         st.rerun()
-
-    with st.popover("🗑️ Clear all data", use_container_width=True):
-        st.caption("Deletes every saved run from disk — results, CSVs and "
-                   "resume points. This cannot be undone.")
-        if st.button("Yes, delete everything", type="primary",
-                     use_container_width=True):
-            delete_all_runs()
-            st.rerun()
 
 st.markdown("---")
 
