@@ -15,6 +15,7 @@ Built for large batches. Three things make that possible:
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -47,6 +48,8 @@ st.markdown("""
 <style>
     .main-title { font-size:2rem; font-weight:800; color:#00d4ff; }
     .subtitle   { color:#888; margin-top:0; }
+    /* Control panel sitting top-right, level with the title */
+    .ctrl-pad   { height: 0.35rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -69,7 +72,9 @@ DEFAULT_STATE = {
 }
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
-        st.session_state[k] = v
+        # Fresh deque per session — sharing the DEFAULT_STATE object would carry
+        # one session's rows straight into the next one.
+        st.session_state[k] = deque(maxlen=v.maxlen) if isinstance(v, deque) else v
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,6 +183,36 @@ def start_worker(run_dir, phones, concurrency, total_target):
             stdout=log_out, stderr=log_out, env=worker_env,
         )
     return proc.pid
+
+
+def new_run_dir():
+    """Unique directory per run. Two runs started inside the same second used to
+    land in the same folder and APPEND to the previous results.jsonl — which is
+    exactly how old results leak into a fresh run's table and CSV."""
+    base = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(RUNS_DIR, base)
+    n = 2
+    while os.path.exists(run_dir):
+        run_dir = os.path.join(RUNS_DIR, f"{base}-{n}")
+        n += 1
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def reset_ui_state():
+    """Wipe every counter, buffer and pointer so the screen goes back to the
+    clean 'nothing has run yet' state. Files on disk are left alone."""
+    if st.session_state.running:
+        kill_tree(st.session_state._pid)
+    for k, v in DEFAULT_STATE.items():
+        st.session_state[k] = deque(maxlen=v.maxlen) if isinstance(v, deque) else v
+    build_csv.clear()          # drop any cached CSV of the previous run
+
+
+def delete_all_runs():
+    """Reset + remove every saved run from disk (no resume points survive)."""
+    reset_ui_state()
+    shutil.rmtree(RUNS_DIR, ignore_errors=True)
 
 
 def reset_live_state(run_dir, pid, total, keep_offsets=False):
@@ -354,19 +389,7 @@ with st.sidebar:
                    f"{eta_txt} for {total:,} numbers")
         st.caption("Best case — shared cloud CPU is slower than this.")
 
-    st.markdown("---")
-    run_btn = st.button(
-        "🚀 Start Lookup", type="primary", use_container_width=True,
-        disabled=(not valid_area or not valid_range or total == 0
-                  or st.session_state.running),
-    )
-
-    if st.session_state.running:
-        if st.button("⏹️ Stop Run", use_container_width=True):
-            kill_tree(st.session_state._pid)
-            st.session_state.running = False
-            st.session_state.run_complete = True
-            st.rerun()
+    st.caption("▶️ Start / Reset are at the top-right of the page.")
 
     # ── Resume ───────────────────────────────────────────────────────────────
     if not st.session_state.running:
@@ -395,9 +418,45 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # Header
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="main-title">📞 InfoLookup Scraper</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Automated phone lookup via infolookup.site</div>',
-            unsafe_allow_html=True)
+head_l, head_r = st.columns([3, 1], gap="large")
+
+with head_l:
+    st.markdown('<div class="main-title">📞 InfoLookup Scraper</div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Automated phone lookup via infolookup.site</div>',
+                unsafe_allow_html=True)
+
+# Controls live top-right, directly under the title, so they are the first
+# thing the user reaches for instead of hunting through the sidebar.
+with head_r:
+    st.markdown('<div class="ctrl-pad"></div>', unsafe_allow_html=True)
+    run_btn = st.button(
+        "🚀 Start Lookup", type="primary", use_container_width=True,
+        disabled=(not valid_area or not valid_range or total == 0
+                  or st.session_state.running),
+    )
+
+    if st.session_state.running:
+        if st.button("⏹️ Stop Run", use_container_width=True):
+            kill_tree(st.session_state._pid)
+            st.session_state.running = False
+            st.session_state.run_complete = True
+            st.rerun()
+
+    if st.button("🔄 Reset", use_container_width=True,
+                 help="Clear the results shown on screen and start fresh. "
+                      "Saved runs stay on disk so you can still resume them."):
+        reset_ui_state()
+        st.rerun()
+
+    with st.popover("🗑️ Clear all data", use_container_width=True):
+        st.caption("Deletes every saved run from disk — results, CSVs and "
+                   "resume points. This cannot be undone.")
+        if st.button("Yes, delete everything", type="primary",
+                     use_container_width=True):
+            delete_all_runs()
+            st.rerun()
+
 st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,9 +466,7 @@ if run_btn and total and not st.session_state.running:
     phones = list(generate_phone_numbers(area_code.strip(), exchange_start,
                                          exchange_end, subscriber_start,
                                          subscriber_end))
-    run_id = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = os.path.join(RUNS_DIR, run_id)
-    os.makedirs(run_dir, exist_ok=True)
+    run_dir = new_run_dir()
     pid = start_worker(run_dir, phones, concurrency, len(phones))
     reset_live_state(run_dir, pid, len(phones))
     st.rerun()
